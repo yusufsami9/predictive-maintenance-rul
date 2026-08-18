@@ -25,6 +25,11 @@ Not included in this repo (`data/` is gitignored) — download `train_FD001.txt`
 | [`01_eda.ipynb`](notebooks/01_eda.ipynb) | Sensor trends, constant-sensor removal, engine lifetime distribution |
 | [`02_feature_engineering.ipynb`](notebooks/02_feature_engineering.ipynb) | RUL labeling, engine-wise train/val split, rolling features, four models (Linear Regression, Random Forest, XGBoost, LSTM), test-set evaluation |
 | [`03_optimization.ipynb`](notebooks/03_optimization.ipynb) | Turns predictions into a maintenance schedule with OR-Tools CP-SAT, bootstrapped |
+| [`04_fd004_stress_test.ipynb`](notebooks/04_fd004_stress_test.ipynb) | Ports the pipeline to FD004 (6 operating conditions, 2 fault modes), diagnoses why it breaks, fixes it |
+
+Shared logic (evaluation, sequence windowing, the LSTM, the scheduler) lives
+in [`src/`](src/) and is imported by whichever notebooks need it, rather than
+redefined in each one — see [Repo layout](#repo-layout).
 
 ## Results (held-out test set, 100 engines)
 
@@ -100,6 +105,35 @@ because the honest negative result — plus the finding that travels with it,
 that prediction RMSE drops from ~21 to ~14 as an engine approaches the
 window's end — is more useful than deleting it.
 
+## Stress test: FD004
+
+FD001 has one operating condition and one fault mode — the easy C-MAPSS
+subset. FD004 has six operating conditions and two fault modes, and is the
+standard harder benchmark. `04_fd004_stress_test.ipynb` asks: does the 02
+pipeline still work if ported as-is?
+
+It doesn't, and the reason is diagnosable. The 7 sensors FD001's EDA called
+"constant" and dropped aren't constant under six operating regimes — their
+apparent variance is mostly which regime the engine is in, not degradation.
+Standardizing over the whole dataset without accounting for that:
+
+```
+val RMSE 26.57, NASA score 171067
+```
+
+Clustering `(op1, op2, op3)` into 6 groups with k-means and z-scoring each
+sensor within its own cluster (statistics from the training split only)
+recovers most of the gap:
+
+```
+val RMSE 16.72, NASA score 93550   (37% RMSE reduction)
+```
+
+Held out FD004 test set (237 of 248 engines; 11 too short for a 30-cycle
+window, excluded and counted): **RMSE 15.58, NASA score 1458** — 6.15/engine
+against FD001's 3.60/engine. FD004 stays harder even after the fix, which is
+what "two fault modes instead of one" should look like.
+
 ## Setup
 
 ```bash
@@ -115,29 +149,37 @@ whichever loads second segfaults the kernel. `brew install libomp` plus
 any of these libraries import) avoids the clash at no measurable cost on
 data this size.
 
-Run notebooks in order: `01` → `02` → `03`. `02` exports predictions and
+Notebooks import shared code as `sys.path.append('..')` then `from src...
+import ...` — run them from inside `notebooks/` (the default for Jupyter)
+and this resolves automatically.
+
+Run notebooks in order: `01` → `02` → `03`, plus `04` independently (it only
+needs `01`'s reasoning, not its outputs). `02` exports predictions and
 validation errors to `outputs/`, which `03` reads — no retraining needed to
 run the optimisation layer.
 
 ## What's next
 
-- **FD004 stress test**: multi-condition, multi-fault-mode subset, to see
-  whether the pipeline generalizes past the easy single-condition case.
 - **Per-engine uncertainty**: the optimisation layer currently uses one
   fleet-wide error distribution. Quantile regression or MC dropout would let
   the scheduler know when the model itself is unsure about a specific engine.
 - **A cost model grounded in something other than an assumption**: the 100:1
   failure/waste ratio and 30-cycle horizon were picked to make the problem
   interesting, not derived from real maintenance economics.
-- **`src/`**: pipeline logic currently lives in the notebooks; extracting the
-  reusable pieces (feature engineering, the LSTM windowing, the scheduler)
-  would make this usable outside a notebook.
+- **FD004 architecture tuning**: 04 reuses FD001's LSTM capacity (hidden
+  size 64, 2 layers, 30-cycle window) unchanged. Whether that's still the
+  right capacity for 2.5x the engines and two fault modes is untested.
 
 ## Repo layout
 
 ```
 data/            gitignored — see Dataset section
-notebooks/       01_eda, 02_feature_engineering, 03_optimization
+notebooks/       01_eda, 02_feature_engineering, 03_optimization, 04_fd004_stress_test
 outputs/         predictions + errors exported by 02, consumed by 03
-src/             (not yet populated, see What's next)
+src/
+  data.py        column layout shared by every C-MAPSS subset
+  evaluation.py  nasa_score
+  sequences.py   create_sequences (per-cycle rows -> fixed-length LSTM windows)
+  lstm_model.py  LSTMRegressor, train_lstm (with best-epoch checkpointing)
+  scheduling.py  cost models, CP-SAT solver, baselines, schedule scoring
 ```
