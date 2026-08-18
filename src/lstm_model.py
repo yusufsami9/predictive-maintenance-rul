@@ -89,3 +89,53 @@ def train_lstm(
 
     info = {"history": history, "best_epoch": best_epoch, "best_rmse": best_rmse}
     return model, val_pred, info
+
+
+def fit_lstm_fixed_epochs(
+    X_train_seq,
+    y_train_seq,
+    epochs,
+    seed=42,
+    batch_size=128,
+    lr=0.001,
+    device_name="cpu",
+):
+    """Fit an LSTM for a preselected epoch count without inspecting holdout labels.
+
+    This is used after model selection: for cross-fitted calibration models and
+    for the final refit on every available training engine.
+    """
+    if epochs < 1:
+        raise ValueError("epochs must be at least 1")
+
+    torch.manual_seed(seed)
+    device = torch.device(device_name)
+
+    X_train_t = torch.tensor(X_train_seq)
+    y_train_t = torch.tensor(y_train_seq)
+    loader = DataLoader(
+        TensorDataset(X_train_t, y_train_t),
+        batch_size=batch_size,
+        shuffle=True,
+    )
+
+    model = LSTMRegressor(n_features=X_train_seq.shape[2]).to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    history = []
+
+    for _ in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        for batch_X, batch_y in loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            optimizer.zero_grad()
+            predictions = model(batch_X)
+            loss = criterion(predictions, batch_y)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * len(batch_X)
+        history.append(epoch_loss / len(X_train_t))
+
+    model.eval()
+    return model, history

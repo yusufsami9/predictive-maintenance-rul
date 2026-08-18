@@ -5,9 +5,9 @@ from ortools.sat.python import cp_model
 def point_estimate_costs(rul_estimate, horizon, failure_cost=100, waste_cost=1):
     """Treat the predicted RUL as if it were the truth.
 
-    The late branch grows with lateness so that servicing an overdue engine
-    tomorrow still beats abandoning it -- without that term the optimiser is
-    indifferent between the two, and it abandons.
+    These costs use exactly the same failure/wasted-life definition as
+    :func:`evaluate_schedule`.  Deterministic tie-breaking in
+    :func:`solve_schedule` handles equal-cost late-service/defer decisions.
     """
     est = np.asarray(rul_estimate, dtype=float)
     t = np.arange(1, horizon + 1)[None, :]
@@ -16,13 +16,11 @@ def point_estimate_costs(rul_estimate, horizon, failure_cost=100, waste_cost=1):
     cost = np.where(
         t <= e,
         np.rint(e - t) * waste_cost,  # life discarded
-        failure_cost + np.rint(t - e) * waste_cost,  # serviced too late
+        failure_cost,  # serviced too late
     )
     cost = np.hstack([np.zeros((len(est), 1)), cost]).astype(int)  # pad t=0, unused
 
-    defer = np.where(
-        est > horizon, 0, failure_cost + np.rint(horizon + 1 - est) * waste_cost
-    ).astype(int)
+    defer = np.where(est > horizon, 0, failure_cost).astype(int)
     return cost, defer
 
 
@@ -36,18 +34,21 @@ def expected_costs(pred, errors, horizon, failure_cost=100, waste_cost=1):
     works out for itself how much buffer each engine deserves.
     """
     pred = np.asarray(pred, dtype=float)
+    errors = np.asarray(errors, dtype=float).ravel()
+    if errors.size == 0:
+        raise ValueError("errors must contain at least one calibration residual")
     possible = pred[:, None] - errors[None, :]  # (n_engines, n_samples)
 
     cost = np.zeros((len(pred), horizon + 1))
     for t in range(1, horizon + 1):
-        fails = possible < t
-        p_fail = fails.mean(axis=1)
-        n_survive = (~fails).sum(axis=1)
-        waste_sum = np.where(fails, 0.0, possible - t).sum(axis=1)
-        mean_waste = np.where(n_survive > 0, waste_sum / np.maximum(n_survive, 1), 0.0)
-        cost[:, t] = p_fail * failure_cost + (1 - p_fail) * mean_waste * waste_cost
+        scenario_cost = np.where(
+            possible < t,
+            failure_cost,
+            (possible - t) * waste_cost,
+        )
+        cost[:, t] = scenario_cost.mean(axis=1)
 
-    defer = np.rint((possible <= horizon).mean(axis=1) * (failure_cost + 0.5 * horizon)).astype(int)
+    defer = np.rint((possible <= horizon).mean(axis=1) * failure_cost).astype(int)
     return np.rint(cost).astype(int), defer
 
 

@@ -1,244 +1,233 @@
 # Predictive Maintenance: RUL Prediction + Maintenance Scheduling
 
-Turbofan engine Remaining Useful Life (RUL) prediction on NASA's C-MAPSS
-dataset, extended past model metrics into an optimisation layer that turns
-predictions into an actual maintenance schedule.
-
-Most RUL projects stop at "here is my RMSE." This one also asks: given these
-predictions, what should a maintenance planner actually do, and does the
-answer hold up under scrutiny?
+Remaining Useful Life (RUL) prediction on NASA's simulated C-MAPSS turbofan
+data, followed by a capacity-constrained maintenance scheduling experiment.
+The project deliberately reports negative and unstable results as well as the
+successful ones: prediction accuracy does not automatically make an optimizer
+useful, and a single neural-network seed is not a reliable conclusion.
 
 ## Dataset
 
-[NASA C-MAPSS](https://www.nasa.gov/intelligent-systems-division/discovery-and-systems-health/pcoe/pcoe-data-set-repository/)
-turbofan degradation simulation, FD001 subset: single operating condition,
-single fault mode. 100 training engines run to failure, 100 test engines
-truncated before failure with the true RUL given separately.
+The data come from NASA's [Prognostics Center of Excellence data repository](https://www.nasa.gov/intelligent-systems-division/discovery-and-systems-health/pcoe/pcoe-data-set-repository/).
+The main experiment uses FD001 (one operating condition and one fault mode):
+100 run-to-failure training engines and 100 test engines truncated before
+failure. FD004 (six operating conditions and two fault modes) is a separate
+stress test.
 
-Not included in this repo (`data/` is gitignored) — download `train_FD001.txt`,
-`test_FD001.txt`, `RUL_FD001.txt` from the link above and place them in `data/`.
+The data are not committed (`data/` is gitignored). Download the C-MAPSS files
+from NASA and place the FD001 and FD004 train, test, and RUL text files in
+`data/`. Please acknowledge the dataset source as NASA requests. The asymmetric
+metric follows the PHM08 challenge described by
+[Saxena et al. (2008)](https://doi.org/10.1109/PHM.2008.4711414).
 
 ## Pipeline
 
-| Notebook | What it does |
+| Notebook | Purpose |
 |---|---|
-| [`01_eda.ipynb`](notebooks/01_eda.ipynb) | Sensor trends, constant-sensor removal, engine lifetime distribution |
-| [`02_feature_engineering.ipynb`](notebooks/02_feature_engineering.ipynb) | RUL labeling, engine-wise train/val split, rolling features, four models (Linear Regression, Random Forest, XGBoost, LSTM), test-set evaluation |
-| [`03_optimization.ipynb`](notebooks/03_optimization.ipynb) | Turns predictions into a maintenance schedule with OR-Tools CP-SAT, bootstrapped |
-| [`04_fd004_stress_test.ipynb`](notebooks/04_fd004_stress_test.ipynb) | Ports the pipeline to FD004 (6 operating conditions, 2 fault modes), diagnoses why it breaks, fixes it |
+| [`01_eda.ipynb`](notebooks/01_eda.ipynb) | Sensor trends, constant-sensor checks, lifetime distribution |
+| [`02_feature_engineering.ipynb`](notebooks/02_feature_engineering.ipynb) | Engine-wise split, features, four predictors, full-data refit, seed stability, cross-fitted calibration |
+| [`03_optimization.ipynb`](notebooks/03_optimization.ipynb) | Capacity-constrained schedules, sensitivity analysis, rolling-horizon caveat, paired bootstrap |
+| [`04_fd004_stress_test.ipynb`](notebooks/04_fd004_stress_test.ipynb) | FD004 operating-condition diagnosis and complete 248-engine test coverage |
 
-Shared logic (evaluation, sequence windowing, the LSTM, the scheduler) lives
-in [`src/`](src/) and is imported by whichever notebooks need it, rather than
-redefined in each one — see [Repo layout](#repo-layout).
+Shared implementations live in [`src/`](src/), and focused regression tests
+cover the metric, sequence boundaries, cost consistency, and solver feasibility,
+determinism, and primary optimality.
 
-## Results (held-out test set, 100 engines)
+## FD001 prediction results
 
-RUL capped at 125 cycles for training, matching the standard C-MAPSS
-convention (degradation is weak before that point).
+RUL is capped at 125 cycles as the training target. The primary table therefore
+uses capped test truth, but predictions are not forcibly clipped. Uncapped RMSE
+and NASA score are also reported in notebook 02.
 
-Metrics are against the **125-capped** test RUL, matching the training target
-— 11 of the 100 test engines genuinely have more than 125 cycles left, and no
-model here can predict above the cap. Uncapped figures are in the notebook and
-don't change the ranking (LSTM 14.53 / 385 uncapped vs 13.49 / 360 capped).
+After selecting the LSTM epoch on a 20-engine validation split, every model is
+refit on all 100 training engines. The table uses the predetermined LSTM seed
+42; the test set is not used to choose a seed.
 
-| Model | RMSE | NASA score |
-|---|---|---|
-| Linear Regression | 21.00 | 1326 |
-| Random Forest | 18.11 | 1241 |
-| XGBoost | 17.82 | 941 |
-| **LSTM** | **13.49** | **360** |
+| Model | Capped RMSE | Capped NASA | Uncapped RMSE | Uncapped NASA |
+|---|---:|---:|---:|---:|
+| XGBoost | **17.21** | **823** | **18.20** | **855** |
+| Random Forest | 18.07 | 1030 | 19.00 | 1063 |
+| Linear Regression | 21.03 | 1337 | 22.02 | 1392 |
+| LSTM, seed 42 | 17.30 | 1393 | 18.26 | 1429 |
 
-The LSTM reads 30-cycle sequences of the 14 raw (non-constant) sensors and
-wins on both metrics simultaneously. The tree models got those same raw
-sensors *plus* rolling mean/std features — but one cycle at a time, so the
-only trend information available to them was whatever those summaries
-preserve, and a mean and a standard deviation are identical for a rising and
-a falling window. Full writeup of that comparison, including a validation-set
-ranking that reverses on test, is in `02_feature_engineering.ipynb`.
+The LSTM is best on the common 3,490-window validation sample (RMSE 13.87),
+but that ranking reverses on test. More importantly, fixed-epoch full refits
+are highly seed-sensitive:
 
-The **NASA score** ([Saxena et al. 2008](https://www.phmsociety.org/sites/phmsociety.org/files/phm_submission/2008/phmc08_challenge_00.pdf))
-penalizes late predictions (engine believed healthier than it is) far more
-than early ones — flying past the safe operating window is more dangerous
-than retiring an engine early. That asymmetry shows up again in the
-optimisation layer's cost model.
+| LSTM seed | Capped RMSE | Capped NASA |
+|---:|---:|---:|
+| 42 | 17.30 | 1393 |
+| 43 | 15.73 | 503 |
+| 44 | 14.06 | 363 |
+| Mean ± sample SD | 15.70 ± 1.62 | 753 ± 559 |
 
-## From prediction to decision
+This is evidence against presenting the old single-seed LSTM score as a stable
+win. Seed 44 is shown for transparency, not selected as the project result,
+because choosing it after looking at test performance would be test leakage.
 
-A predicted RUL isn't a decision. A planner needs: *which engines go into
-the shop this cycle*, given limited capacity. `03_optimization.ipynb` builds
-that layer on top of the LSTM's test predictions.
+The flat models and LSTM are now compared on exactly the same validation rows:
+the first 29 cycles of each engine are excluded for every model because they
+cannot form a 30-cycle sequence.
 
-**Setup:** 100 engines, 30-cycle planning horizon, a capacity-constrained
-shop, minimizing `wasted remaining life (1/cycle) + unplanned failure (100)`
-— the same late-vs-early asymmetry as the NASA score. Solved exactly with
-[OR-Tools CP-SAT](https://developers.google.com/optimization/cp) (cross-checked
-against Gurobi on one scenario — both solvers land on the identical schedule
-and cost).
+## From prediction to a maintenance decision
 
-One thing worth flagging, because it silently corrupted an earlier version of
-these numbers: **many schedules tie on the priced objective while differing
-substantially in what they actually cost against the hidden truth.** With an
-arbitrary tie-break, identical inputs returned realised costs of 1256 or 1457
-run to run — all of them provably optimal. The solver now breaks ties
-deterministically, preferring earlier service and preferring service over
-deferral, both of which leave more slack for the prediction error the priced
-objective can't see. Any exact-optimisation result reported without checking
-this is reporting one arbitrary member of a tied set.
+Notebook 03 schedules 100 engines over a 30-cycle horizon with three shop slots
+per cycle. The illustrative economics charge 100 for an unplanned failure and
+1 per discarded cycle of remaining life. The cost matrices and realized
+evaluator now share one definition:
 
-**Headline finding, and it's the one that survived scrutiny:** accounting for
-prediction uncertainty is worth roughly **3x**, whether you do it with a
-fixed safety margin, an expected-cost objective over the model's error
-distribution, or a simple threshold rule. Scheduling against the raw point
-estimate is what's fragile — the exact solver spends every believed cycle of
-slack and leaves zero buffer for the ~14-cycle RMSE the model actually has.
+- service on or before failure: discarded remaining life;
+- service after failure: one flat failure charge;
+- defer past the horizon: one failure charge only if failure occurs within it.
 
-```
-capacity 3, bootstrapped over 200 resampled fleets (95% interval)
-  Greedy + safety margin        429   [309,  576]
-  CP-SAT + safety margin        458   [309,  793]
-  CP-SAT, expected cost         473   [294,  697]
-  Threshold rule (oracle)       476   [278,  701]
-  ── uncertainty-aware strategies above, raw point estimates below ──
-  Greedy, raw prediction       1477   [762, 2154]
-  CP-SAT, raw prediction       1489   [762, 2221]
-```
+OR-Tools CP-SAT solves the discrete model. Its deterministic secondary
+tie-break prefers earlier service and service over deferral only among schedules
+with the same primary cost.
 
-The threshold rule is marked *oracle* because its cut-off is re-tuned on the
-test outcome of every replicate. That makes it an upper bound on what the
-policy family could do, not a number a deployed threshold would reach — it
-is in the table as a deliberately strong rival, not as a deployable
-strategy.
+Uncertainty is calibrated with five-fold cross-fitting over the 80 engines that
+did not participate in epoch selection. Each is held out, artificially truncated
+once at an independently sampled RUL, and contributes one residual. The model in
+that fold is trained on the other 84 engines (the 64 remaining calibration-pool
+engines plus the 20 selection engines) for the already-selected fixed epoch
+count. This replaces 3,490 overlapping residuals from the epoch-selection set
+with 80 engine-level out-of-fold residuals. The regenerated margin and scheduling
+results below come from that separated calibration sample; its 90th percentile
+is a 26.04-cycle safety margin.
 
-**What did *not* survive bootstrapping:** an earlier pass claimed the
-expected-cost formulation was clearly the best uncertainty-aware method. It
-wasn't — that read came from a single 100-engine sample scored once. Across
-200 resampled fleets, the uncertainty-aware strategies are statistically
-indistinguishable at this capacity: P(expected cost cheaper) is 0.38 against
-greedy+margin and 0.44 against CP-SAT+margin, both coin flips. The one place
-exact optimisation demonstrably earns its complexity is under tighter
-capacity (1 slot/cycle), where a uniform margin can't express which engines
-deserve the scarce early slots and the expected-cost model beats it in 100%
-of replicates.
+At capacity 3, 200 fleet bootstrap replicates give:
 
-**Does the 100:1 price hold the conclusion up?** The notebook re-optimises
-every strategy from scratch at ratios from 20:1 to 500:1, rather than
-re-pricing a schedule that was chosen at 100:1 — those answer different
-questions, and only the first one is a sensitivity analysis. The
-expected-cost strategy visibly adapts (211 at 20:1, 503 at 500:1) while the
-raw-prediction strategies degrade steeply as failures get more expensive
-(338 → 7538). The uncertainty-aware-beats-raw conclusion holds at every
-ratio tested.
-
-A rolling-horizon simulation (re-plan every cycle instead of once) is also
-in the notebook, with an explicit caveat: FD001's test trajectories are too
-short past truncation for anything to actually fail inside the simulated
-window, so that comparison doesn't support a conclusion either way. Left in
-because the honest negative result — plus the finding that travels with it,
-that prediction RMSE drops from ~21 to ~14 as an engine approaches the
-window's end — is more useful than deleting it.
-
-## Stress test: FD004
-
-FD001 has one operating condition and one fault mode — the easy C-MAPSS
-subset. FD004 has six operating conditions and two fault modes, and is the
-standard harder benchmark. `04_fd004_stress_test.ipynb` asks: does the 02
-pipeline still work if ported as-is?
-
-It doesn't, and the reason is diagnosable. The 7 sensors FD001's EDA called
-"constant" and dropped aren't constant under six operating regimes — their
-apparent variance is mostly which regime the engine is in, not degradation.
-Standardizing over the whole dataset without accounting for that:
-
-```
-val RMSE 26.57, NASA score 171067
+```text
+CP-SAT, expected cost           391  [ 237,  627]
+Oracle-retuned threshold        453  [ 278,  684]
+Greedy + safety margin          579  [ 391,  828]
+CP-SAT + safety margin          667  [ 434, 1094]
+Greedy, raw prediction         1853  [1213, 2604]
+CP-SAT, raw prediction         1895  [1236, 2618]
 ```
 
-Clustering `(op1, op2, op3)` into 6 groups with k-means and z-scoring each
-sensor within its own cluster (statistics from the training split only)
-recovers most of the gap:
+The strong conclusion is narrow: ignoring prediction error is expensive under
+these assumed economics. Paired expected-cost-minus-raw intervals exclude zero
+by a large margin. The experiment does **not** show that exact optimization is
+better than a simple robust heuristic:
 
-```
-val RMSE 16.72, NASA score 93550   (37% RMSE reduction)
-```
+- expected cost minus greedy+margin: mean -188, paired 95% interval [-432, 80];
+- expected cost minus CP-SAT+margin: mean -276, paired 95% interval [-646, 22].
 
-Held out FD004 test set (237 of 248 engines; 11 too short for a 30-cycle
-window, excluded and counted): **RMSE 15.58, NASA score 1458** — 6.15/engine
-against FD001's 3.60/engine. FD004 stays harder even after the fix, which is
-what "two fault modes instead of one" should look like.
+At the tighter capacity of one slot per cycle, expected cost reliably beats
+CP-SAT with a uniform margin, but not greedy+margin or the oracle threshold.
+The oracle threshold has the lowest mean there, while expected cost is second.
+Exact optimization therefore has not conclusively earned its extra operational
+complexity over simple heuristics in this experiment.
 
-## Setup
+The threshold comparator is intentionally optimistic: its cutoff is re-tuned
+on the observed test outcome in every replicate and at every failure-cost ratio.
+It is an oracle benchmark, not a deployable result.
+
+### Sensitivity and solver cross-check
+
+Every strategy is rebuilt at failure costs 20, 50, 100, 200, and 500 rather
+than merely repricing one fixed schedule. The oracle-selected threshold changes
+from 25 to 40 to 50 across those ratios. All listed error-aware approaches cost
+less than raw scheduling at ratios 50–500; at 20, only expected cost and the
+oracle threshold do. The conclusion remains conditional on the hypothetical
+economics and this one test fleet.
+
+Gurobi and CP-SAT match the primary point-cost objective (1806) in the guarded
+cross-check. Their schedules and realized costs do not match: CP-SAT's explicit
+tie-break realizes 604, while Gurobi's arbitrary primary-optimal schedule
+realizes 2193. This is not solver disagreement about the optimum; it demonstrates
+why a specified tie-break matters when the primary objective has many optima.
+
+The rolling-horizon section remains a deliberately inconclusive diagnostic.
+The recorded FD001 trajectories do not continue far enough past the simulated
+decision point for any engine to fail during the 15-cycle rolling window, so it
+cannot support a claim that replanning helps or hurts.
+
+## FD004 stress test
+
+Applying FD001-style global standardization to FD004 confounds degradation with
+six operating regimes. On the engine-wise validation split:
+
+| FD004 validation pipeline | RMSE | NASA score |
+|---|---:|---:|
+| Naive global normalization | 26.57 | 171067 |
+| Six-cluster condition-aware normalization | **16.72** | **93550** |
+
+The valid result is that condition-aware normalization substantially improves
+validation performance. For the official test population:
+
+- the original 30-cycle model scores RMSE 15.58 / NASA 1458 on 237 engines;
+- 11 engines cannot form that window;
+- the window is set to the shortest unlabeled test history (19 cycles), its epoch
+  count is selected on validation, and it is refit on all 249 training engines;
+  it scores capped RMSE **17.37** / NASA **2035** on all **248** test engines.
+  Against uncapped truth it scores RMSE 28.64 / NASA 6226.
+
+The 19-cycle result solves the coverage problem but does not prove that 19 cycles
+is a better architecture. Cross-subset metrics also do not prove FD004 is harder
+in this run: its capped RMSE is slightly higher than FD001 seed 42, while its
+NASA score per engine is lower. Dataset size, endpoint distribution, window
+length, and FD001 seed instability are confounded.
+
+## Reproduce
+
+The committed notebooks were executed with Python 3.14.0 and the exact package
+versions in [`requirements.txt`](requirements.txt).
 
 ```bash
-python -m venv venv
+python3.14 -m venv venv
 source venv/bin/activate
-pip install pandas numpy scikit-learn xgboost torch ortools matplotlib
-# gurobipy optional, only used for the one cross-check cell
+pip install -r requirements.txt
+python -m unittest discover -s tests -v
+jupyter notebook
 ```
 
-**macOS:** XGBoost and PyTorch each bundle their own OpenMP runtime, and
-whichever loads second segfaults the kernel. `brew install libomp` plus
-`OMP_NUM_THREADS=1` (set at the top of `02_feature_engineering.ipynb`, before
-any of these libraries import) avoids the clash at no measurable cost on
-data this size.
+Run notebooks `01` → `02` → `03`. Notebook `04` is a separate FD004 experiment
+but reads the regenerated FD001 export for its comparison table. Notebook `02`
+writes `test_predictions.csv`, `lstm_val_errors.csv`, and
+`rolling_predictions.csv` to `outputs/`; notebook `03` consumes them.
 
-Notebooks import shared code as `sys.path.append('..')` then `from src...
-import ...` — run them from inside `notebooks/` (the default for Jupyter)
-and this resolves automatically.
-
-Run notebooks in order: `01` → `02` → `03`, plus `04` independently (it only
-needs `01`'s reasoning, not its outputs). `02` exports predictions and
-validation errors to `outputs/`, which `03` reads — no retraining needed to
-run the optimisation layer.
+On macOS, XGBoost and PyTorch may load competing OpenMP runtimes. The modeling
+notebooks set `OMP_NUM_THREADS=1` before importing either library. Gurobi 13.0.2
+is optional and only used by a guarded cross-check cell; OR-Tools is the required
+open-source solver.
 
 ## Known limitations
 
-Things that are wrong-ish and known, rather than wrong and hidden:
+- The 125-cycle target cap is a modeling convention. Capped results align with
+  training, while uncapped results expose the loss on genuinely longer-lived
+  test engines; neither definition is universally correct.
+- Three LSTM seeds are enough to expose instability, not enough to estimate its
+  full distribution. There is still one engine split and no nested
+  hyperparameter-selection protocol.
+- Calibration is out-of-fold and engine-level, but it uses one artificial
+  truncation per engine and one global residual distribution. Fold models train
+  on 84 engines while the final predictor trains on 100.
+- The 100:1 cost ratio, 30-cycle horizon, and capacity values are illustrative,
+  not derived from real maintenance operations. No schedule should be deployed
+  from this study.
+- Bootstrap intervals resample the same 100-engine test fleet; they are not an
+  external replication. The oracle threshold intentionally uses test outcomes.
+- The FD004 study trains a separate model and changes the sequence length for
+  full coverage; the unlabeled test history lengths determine that 19-cycle
+  choice. It is not a controlled transfer/generalization experiment.
+- The rolling-horizon test data are insufficient to evaluate actual failures
+  during replanning.
 
-- **The optimiser's cost function and the evaluator's are not identical.**
-  The evaluator charges a flat penalty for a failure; the optimiser's cost
-  matrix adds a term that grows with lateness. That term exists for a real
-  reason — without it the solver is indifferent between servicing an overdue
-  engine tomorrow and abandoning it forever, and it abandons — but it means
-  "optimal" is optimal for the surrogate, not for the stated economics. The
-  clean fix is one cost definition covering early service, late service,
-  failure, deferral and post-failure downtime, used by both. That needs
-  post-failure economics to be *decided*, which is a modelling call, not a
-  code change.
-- **The uncertainty distribution is mildly optimistic.** The LSTM's
-  best epoch is chosen on validation RMSE, and the residuals exported as the
-  scheduler's error distribution come from that same validation set. It isn't
-  test leakage, but validation is doing two jobs. There's also a sampling
-  mismatch: calibration uses 3490 heavily-overlapping windows from 20
-  engines, while scheduling applies one final prediction per engine.
-  Engine-level out-of-fold residuals would be the honest version.
-- **Single split, single seed.** One engine-wise split and one torch seed
-  produced 13.49. Repeated splits or seeds would say how much of that is
-  stable.
-- **FD004 excludes 11 of 248 test engines** that are shorter than the
-  30-cycle window, so its test number is not a complete FD004 benchmark.
+## Repository layout
 
-## What's next
-
-- **Per-engine uncertainty**: the optimisation layer currently uses one
-  fleet-wide error distribution. Quantile regression or MC dropout would let
-  the scheduler know when the model itself is unsure about a specific engine.
-- **A cost model grounded in something other than an assumption**: the 100:1
-  failure/waste ratio and 30-cycle horizon were picked to make the problem
-  interesting, not derived from real maintenance economics.
-- **FD004 architecture tuning**: 04 reuses FD001's LSTM capacity (hidden
-  size 64, 2 layers, 30-cycle window) unchanged. Whether that's still the
-  right capacity for 2.5x the engines and two fault modes is untested.
-
-## Repo layout
-
-```
-data/            gitignored — see Dataset section
-notebooks/       01_eda, 02_feature_engineering, 03_optimization, 04_fd004_stress_test
-outputs/         predictions + errors exported by 02, consumed by 03
+```text
+data/            gitignored NASA C-MAPSS files
+notebooks/       four executed analysis notebooks
+outputs/         FD001 predictions and cross-fitted residuals consumed by 03
 src/
-  data.py        column layout shared by every C-MAPSS subset
-  evaluation.py  nasa_score
-  sequences.py   create_sequences (per-cycle rows -> fixed-length LSTM windows)
-  lstm_model.py  LSTMRegressor, train_lstm (with best-epoch checkpointing)
-  scheduling.py  cost models, CP-SAT solver, baselines, schedule scoring
+  data.py        shared C-MAPSS column layout
+  evaluation.py  asymmetric NASA score
+  sequences.py   engine-bounded sequence windows
+  lstm_model.py  selected-epoch and fixed-epoch LSTM training
+  scheduling.py  cost models, baselines, CP-SAT solver, realized evaluator
+tests/           focused unit/regression tests
+requirements.txt exact executed environment
+LICENSE          MIT license
+CITATION.cff     software citation metadata
 ```

@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this project, please cite the software and the C-MAPSS dataset source."
+title: "Predictive Maintenance: RUL Prediction and Maintenance Scheduling"
+type: software
+version: 1.0.0
+authors:
+  - family-names: "Sami"
+    given-names: "Yusuf"
+date-released: 2026-08-18
+license: MIT
