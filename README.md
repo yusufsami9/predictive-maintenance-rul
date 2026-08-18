@@ -36,6 +36,11 @@ redefined in each one — see [Repo layout](#repo-layout).
 RUL capped at 125 cycles for training, matching the standard C-MAPSS
 convention (degradation is weak before that point).
 
+Metrics are against the **125-capped** test RUL, matching the training target
+— 11 of the 100 test engines genuinely have more than 125 cycles left, and no
+model here can predict above the cap. Uncapped figures are in the notebook and
+don't change the ranking (LSTM 14.53 / 385 uncapped vs 13.49 / 360 capped).
+
 | Model | RMSE | NASA score |
 |---|---|---|
 | Linear Regression | 21.00 | 1326 |
@@ -44,10 +49,12 @@ convention (degradation is weak before that point).
 | **LSTM** | **13.49** | **360** |
 
 The LSTM reads 30-cycle sequences of the 14 raw (non-constant) sensors and
-wins on both metrics simultaneously — the tree models saw only rolling
-mean/std summaries, which erase trend direction. Full writeup of that
-comparison, including a validation-set ranking that reverses on test, is in
-`02_feature_engineering.ipynb`.
+wins on both metrics simultaneously. The tree models got those same raw
+sensors *plus* rolling mean/std features — but one cycle at a time, so the
+only trend information available to them was whatever those summaries
+preserve, and a mean and a standard deviation are identical for a rising and
+a falling window. Full writeup of that comparison, including a validation-set
+ranking that reverses on test, is in `02_feature_engineering.ipynb`.
 
 The **NASA score** ([Saxena et al. 2008](https://www.phmsociety.org/sites/phmsociety.org/files/phm_submission/2008/phmc08_challenge_00.pdf))
 penalizes late predictions (engine believed healthier than it is) far more
@@ -68,6 +75,16 @@ shop, minimizing `wasted remaining life (1/cycle) + unplanned failure (100)`
 against Gurobi on one scenario — both solvers land on the identical schedule
 and cost).
 
+One thing worth flagging, because it silently corrupted an earlier version of
+these numbers: **many schedules tie on the priced objective while differing
+substantially in what they actually cost against the hidden truth.** With an
+arbitrary tie-break, identical inputs returned realised costs of 1256 or 1457
+run to run — all of them provably optimal. The solver now breaks ties
+deterministically, preferring earlier service and preferring service over
+deferral, both of which leave more slack for the prediction error the priced
+objective can't see. Any exact-optimisation result reported without checking
+this is reporting one arbitrary member of a tied set.
+
 **Headline finding, and it's the one that survived scrutiny:** accounting for
 prediction uncertainty is worth roughly **3x**, whether you do it with a
 fixed safety margin, an expected-cost objective over the model's error
@@ -78,24 +95,39 @@ slack and leaves zero buffer for the ~14-cycle RMSE the model actually has.
 ```
 capacity 3, bootstrapped over 200 resampled fleets (95% interval)
   Greedy + safety margin        429   [309,  576]
-  CP-SAT + safety margin        454   [309,  798]
-  CP-SAT, expected cost         464   [286,  694]
-  Threshold rule (tuned)        476   [278,  701]
+  CP-SAT + safety margin        458   [309,  793]
+  CP-SAT, expected cost         473   [294,  697]
+  Threshold rule (oracle)       476   [278,  701]
   ── uncertainty-aware strategies above, raw point estimates below ──
   Greedy, raw prediction       1477   [762, 2154]
-  CP-SAT, raw prediction       1487   [796, 2223]
+  CP-SAT, raw prediction       1489   [762, 2221]
 ```
+
+The threshold rule is marked *oracle* because its cut-off is re-tuned on the
+test outcome of every replicate. That makes it an upper bound on what the
+policy family could do, not a number a deployed threshold would reach — it
+is in the table as a deliberately strong rival, not as a deployable
+strategy.
 
 **What did *not* survive bootstrapping:** an earlier pass claimed the
 expected-cost formulation was clearly the best uncertainty-aware method. It
 wasn't — that read came from a single 100-engine sample scored once. Across
-200 resampled fleets, the four uncertainty-aware strategies are
-statistically indistinguishable at this capacity (pairwise "which is
-cheaper" probabilities sit near a coin flip). The one place exact
-optimisation demonstrably earns its complexity is under tighter capacity
-(1 slot/cycle), where a uniform margin can't express which engines deserve
-the scarce early slots and the expected-cost model beats it in ~100% of
-replicates.
+200 resampled fleets, the uncertainty-aware strategies are statistically
+indistinguishable at this capacity: P(expected cost cheaper) is 0.38 against
+greedy+margin and 0.44 against CP-SAT+margin, both coin flips. The one place
+exact optimisation demonstrably earns its complexity is under tighter
+capacity (1 slot/cycle), where a uniform margin can't express which engines
+deserve the scarce early slots and the expected-cost model beats it in 100%
+of replicates.
+
+**Does the 100:1 price hold the conclusion up?** The notebook re-optimises
+every strategy from scratch at ratios from 20:1 to 500:1, rather than
+re-pricing a schedule that was chosen at 100:1 — those answer different
+questions, and only the first one is a sensitivity analysis. The
+expected-cost strategy visibly adapts (211 at 20:1, 503 at 500:1) while the
+raw-prediction strategies degrade steeply as failures get more expensive
+(338 → 7538). The uncertainty-aware-beats-raw conclusion holds at every
+ratio tested.
 
 A rolling-horizon simulation (re-plan every cycle instead of once) is also
 in the notebook, with an explicit caveat: FD001's test trajectories are too
@@ -157,6 +189,33 @@ Run notebooks in order: `01` → `02` → `03`, plus `04` independently (it only
 needs `01`'s reasoning, not its outputs). `02` exports predictions and
 validation errors to `outputs/`, which `03` reads — no retraining needed to
 run the optimisation layer.
+
+## Known limitations
+
+Things that are wrong-ish and known, rather than wrong and hidden:
+
+- **The optimiser's cost function and the evaluator's are not identical.**
+  The evaluator charges a flat penalty for a failure; the optimiser's cost
+  matrix adds a term that grows with lateness. That term exists for a real
+  reason — without it the solver is indifferent between servicing an overdue
+  engine tomorrow and abandoning it forever, and it abandons — but it means
+  "optimal" is optimal for the surrogate, not for the stated economics. The
+  clean fix is one cost definition covering early service, late service,
+  failure, deferral and post-failure downtime, used by both. That needs
+  post-failure economics to be *decided*, which is a modelling call, not a
+  code change.
+- **The uncertainty distribution is mildly optimistic.** The LSTM's
+  best epoch is chosen on validation RMSE, and the residuals exported as the
+  scheduler's error distribution come from that same validation set. It isn't
+  test leakage, but validation is doing two jobs. There's also a sampling
+  mismatch: calibration uses 3490 heavily-overlapping windows from 20
+  engines, while scheduling applies one final prediction per engine.
+  Engine-level out-of-fold residuals would be the honest version.
+- **Single split, single seed.** One engine-wise split and one torch seed
+  produced 13.49. Repeated splits or seeds would say how much of that is
+  stable.
+- **FD004 excludes 11 of 248 test engines** that are shorter than the
+  30-cycle window, so its test number is not a complete FD004 benchmark.
 
 ## What's next
 

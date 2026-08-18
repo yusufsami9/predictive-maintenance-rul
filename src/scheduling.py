@@ -56,6 +56,17 @@ def solve_schedule(cost, defer, horizon, capacity, verbose=False):
 
     x[i, t] = 1 when engine i is serviced in period t. Leaving every x[i, t] at
     zero means deferring the engine past the window, priced by defer[i].
+
+    Many schedules tie on the priced objective while differing wildly in what
+    they actually cost against the hidden truth -- with an arbitrary tie-break
+    the same inputs returned realised costs of 1256 or 1457 run to run. So ties
+    are broken deterministically, and in a direction that is operationally
+    defensible rather than arbitrary: prefer servicing earlier, and prefer
+    servicing at all over deferring. Both leave more slack for the prediction
+    error the priced objective cannot see.
+
+    The tie-break is scaled to be strictly dominated by the real objective, so
+    it only ever chooses among genuinely equal-cost schedules.
     """
     n = cost.shape[0]
     model = cp_model.CpModel()
@@ -68,26 +79,37 @@ def solve_schedule(cost, defer, horizon, capacity, verbose=False):
     for t in range(1, horizon + 1):  # the shop cannot be oversubscribed
         model.Add(sum(x[i, t] for i in range(n)) <= capacity)
 
-    terms = []
+    terms, tie_break = [], []
     for i in range(n):
-        for t in range(1, horizon + 1):
-            terms.append(int(cost[i, t]) * x[i, t])
+        deferred = 1 - sum(x[i, t] for t in range(1, horizon + 1))
+        for i_t in range(1, horizon + 1):
+            terms.append(int(cost[i, i_t]) * x[i, i_t])
+            tie_break.append(i_t * x[i, i_t])  # earlier slots preferred
         # (1 - sum_t x[i,t]) equals 1 exactly when engine i is deferred.
-        terms.append(int(defer[i]) * (1 - sum(x[i, t] for t in range(1, horizon + 1))))
+        terms.append(int(defer[i]) * deferred)
+        tie_break.append((horizon + 1) * deferred)  # worse than any real slot
 
-    model.Minimize(sum(terms))
+    # Largest possible tie-break value, so one unit of real cost always outranks
+    # the entire tie-break term.
+    tie_break_scale = n * (horizon + 1) + 1
+    model.Minimize(tie_break_scale * sum(terms) + sum(tie_break))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 120.0
-    solver.parameters.num_workers = 8
+    # Single worker + fixed seed: multi-threaded search picks whichever optimum
+    # it reaches first, which is exactly the non-determinism we are removing.
+    solver.parameters.num_workers = 1
+    solver.parameters.random_seed = 0
     status = solver.Solve(model)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError(f"no solution: {solver.StatusName(status)}")
 
     if verbose:
+        # Report the real priced objective, not the tie-break-scaled one solved.
+        planned_cost = solver.ObjectiveValue() // tie_break_scale
         print(
-            f"  {solver.StatusName(status)}  planned cost={solver.ObjectiveValue():.0f}  "
+            f"  {solver.StatusName(status)}  planned cost={planned_cost:.0f}  "
             f"{solver.WallTime():.2f}s"
         )
 
