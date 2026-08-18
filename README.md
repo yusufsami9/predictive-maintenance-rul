@@ -45,7 +45,7 @@ refit on all 100 training engines. The table uses the predetermined LSTM seed
 
 | Model | Capped RMSE | Capped NASA | Uncapped RMSE | Uncapped NASA |
 |---|---:|---:|---:|---:|
-| XGBoost | **17.21** | **823** | **18.20** | **855** |
+| XGBoost | 17.21 | 823 | 18.20 | 855 |
 | Random Forest | 18.07 | 1030 | 19.00 | 1063 |
 | Linear Regression | 21.03 | 1337 | 22.02 | 1392 |
 | LSTM, seed 42 | 17.30 | 1393 | 18.26 | 1429 |
@@ -61,9 +61,28 @@ are highly seed-sensitive:
 | 44 | 14.06 | 363 |
 | Mean ± sample SD | 15.70 ± 1.62 | 753 ± 559 |
 
-This is evidence against presenting the old single-seed LSTM score as a stable
-win. Seed 44 is shown for transparency, not selected as the project result,
-because choosing it after looking at test performance would be test leakage.
+**No model is declared the winner here, and the table is deliberately not
+bolded.** Seed 42 was fixed in advance, so quoting it is not cherry-picking —
+but it is also the *worst* of the three seeds, and the LSTM's three-seed mean
+(15.70) is lower than XGBoost's 17.21. With three seeds the 95% interval on
+that mean is roughly [11.7, 19.7], which contains XGBoost. The supported
+statement is that **these two cannot be separated on this test set**, not that
+either one wins. Reading "XGBoost wins" off seed 42 would be the mirror image
+of the earlier mistake of reading "the LSTM wins" off a single lucky run.
+
+Two caveats that keep this comparison from being clean:
+
+- **The seed budget is asymmetric.** The LSTM was measured across three seeds;
+  XGBoost and Random Forest were run once each at `random_state=42`. Tree
+  ensembles have their own seed variance and it was never measured here, so a
+  three-seed model is being compared against a one-seed point estimate.
+- **The refit protocol probably costs the LSTM something.** The epoch count was
+  selected on 80 engines and then reused verbatim for the 100-engine refit, but
+  25% more data at the same epoch count means 25% more gradient steps. Epoch
+  count is not a transferable hyperparameter across dataset sizes, so part of
+  the 13.49 → 17.30 drop is likely protocol rather than a property of the model.
+  Re-selecting the epoch count for the refit size, or keeping the checkpointed
+  80-engine model as the deliverable, are both defensible alternatives.
 
 The flat models and LSTM are now compared on exactly the same validation rows:
 the first 29 cycles of each engine are excluded for every model because they
@@ -107,17 +126,33 @@ CP-SAT, raw prediction         1895  [1236, 2618]
 
 The strong conclusion is narrow: ignoring prediction error is expensive under
 these assumed economics. Paired expected-cost-minus-raw intervals exclude zero
-by a large margin. The experiment does **not** show that exact optimization is
-better than a simple robust heuristic:
+by a large margin, in 100% of replicates.
 
-- expected cost minus greedy+margin: mean -188, paired 95% interval [-432, 80];
-- expected cost minus CP-SAT+margin: mean -276, paired 95% interval [-646, 22].
+Against the *robust* heuristics the picture is genuinely mixed, and both halves
+of it matter — the paired mean difference and how often each side actually wins
+say different things, because the differences are heavy-tailed:
 
-At the tighter capacity of one slot per cycle, expected cost reliably beats
-CP-SAT with a uniform margin, but not greedy+margin or the oracle threshold.
-The oracle threshold has the lowest mean there, while expected cost is second.
-Exact optimization therefore has not conclusively earned its extra operational
-complexity over simple heuristics in this experiment.
+| capacity 3, expected cost minus | mean | paired 95% | wins |
+|---|---:|---|---:|
+| greedy + margin | -188 | [-432, 80] | 92% |
+| CP-SAT + margin | -276 | [-646, 22] | 96% |
+| oracle threshold | -62 | [-112, -24] | 99% |
+
+Against both margin-based strategies, expected cost is cheaper in the large
+majority of resampled fleets, but the interval on the *average* saving still
+clips zero — a 92% win rate is real evidence, just not a 95%-level claim about
+the mean. Against the oracle threshold at this capacity it is a clean win: the
+interval excludes zero and it wins 99% of replicates.
+
+Capacity 1 is where it reverses. Expected cost still beats CP-SAT+margin in
+100% of replicates and greedy+margin in 94%, but **loses to the oracle
+threshold** — 26% wins, 61% losses, mean +87 [-281, 409]. When slots are
+scarcest, an oracle-tuned cutoff is the strongest strategy in the comparison.
+
+Overall: **exact optimization has not conclusively earned its extra operational
+complexity.** It is ahead of the deployable heuristics almost everywhere, but
+usually with an interval that clips zero, and the one comparator it clearly
+loses to at tight capacity is a benchmark nobody could actually deploy.
 
 The threshold comparator is intentionally optimistic: its cutoff is re-tuned
 on the observed test outcome in every replicate and at every failure-cost ratio.
